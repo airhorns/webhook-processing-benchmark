@@ -150,9 +150,9 @@ if [[ "$SMOKE_STATUS" != "200" ]]; then
 fi
 echo "[bench] smoke ok (200), starting client..." >&2
 
-# CPU sampler — psutil-based, polls server PID + descendants every 250ms.
-CPU_SAMPLES="$RESULTS_DIR/.${LANG_}-${CORES}c-${LABEL}.cpu"
-"$REPO_ROOT/bench/cpu_sampler.py" "$SERVER_PID" "$CPU_SAMPLES" 0.25 &
+# Resource sampler — psutil-based, polls server PID + descendants every 250ms.
+RESOURCE_SAMPLES="$RESULTS_DIR/.${LANG_}-${CORES}c-${LABEL}.resources"
+"$REPO_ROOT/bench/cpu_sampler.py" "$SERVER_PID" "$RESOURCE_SAMPLES" 0.25 &
 SAMPLER_PID=$!
 
 # Run client and capture summary JSON.
@@ -171,13 +171,22 @@ CLIENT_JSON=$("$CLIENT_BIN" \
 kill "$SAMPLER_PID" 2>/dev/null || true
 wait "$SAMPLER_PID" 2>/dev/null || true
 
-# Compute server CPU avg/max from samples. File format: "ts_ms cpu_pct", header on row 1.
-# Skip first 2 data rows (first sample is always 0 right after sampler start; warmup also bleeds).
-read CPU_AVG CPU_MAX SAMPLES <<<"$(
-  awk 'NR>3 {if ($2+0 > max) max = $2+0; sum += $2+0; n++}
-    END {if (n==0) print "0 0 0"; else printf "%.2f %.2f %d", sum/n, max, n}' "$CPU_SAMPLES"
+# Compute server CPU and RSS memory avg/max from samples.
+# File format: "ts_ms cpu_pct rss_bytes", header on row 1.
+# Skip first 2 data rows (first CPU sample is always 0 right after sampler start; warmup also bleeds).
+read CPU_AVG CPU_MAX RSS_AVG_MB RSS_MAX_MB SAMPLES <<<"$(
+  awk 'NR>3 {
+      cpu=$2+0; rss=$3+0;
+      if (cpu > cpu_max) cpu_max = cpu;
+      if (rss > rss_max) rss_max = rss;
+      cpu_sum += cpu; rss_sum += rss; n++
+    }
+    END {
+      if (n==0) print "0 0 0 0 0";
+      else printf "%.2f %.2f %.2f %.2f %d", cpu_sum/n, cpu_max, (rss_sum/n)/1048576, rss_max/1048576, n
+    }' "$RESOURCE_SAMPLES"
 )"
-rm -f "$CPU_SAMPLES"
+rm -f "$RESOURCE_SAMPLES"
 
 # Build the final result JSON by merging client summary + server CPU + meta.
 python3 - "$RESULT_FILE" <<PY
@@ -203,6 +212,8 @@ out = {
   "server_cpu_avg_pct": $CPU_AVG,
   "server_cpu_max_pct": $CPU_MAX,
   "server_cpu_samples": $SAMPLES,
+  "server_memory_rss_avg_mb": $RSS_AVG_MB,
+  "server_memory_rss_max_mb": $RSS_MAX_MB,
   "server_cpu_cap_pct": $CORES * 100,
   "client_cpu_pct_of_one_core": client["client_cpu_pct_of_one_core"],
 }
